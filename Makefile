@@ -9,6 +9,8 @@ MEMO_SUB_PREFIX ?= /usr
 LIBDIR          ?= $(MEMO_PREFIX)$(MEMO_SUB_PREFIX)/lib
 INCLUDEDIR      ?= $(MEMO_PREFIX)$(MEMO_SUB_PREFIX)/include
 
+DEFAULT_INTERPRETER ?= /bin/sh
+
 SOVER := 1
 SRC   := $(wildcard *.c)
 
@@ -16,10 +18,14 @@ ifeq ($(shell uname -s), Linux)
 CFLAGS          += -fPIE -fPIC
 endif
 
+ifeq ($(LIBIOSEXEC_PREFIXED_ROOT),)
+LIBIOSEXEC_PREFIXED_ROOT := 1
+endif
+
 all: libiosexec.$(SOVER).dylib libiosexec.a
 
 %.o: %.c
-	$(CC) -c $(CFLAGS) -fvisibility=hidden -D_PW_NAME_LEN=MAXLOGNAME -DLIBIOSEXEC_INTERNAL $^
+	$(CC) -c $(CFLAGS) -fvisibility=hidden -D_PW_NAME_LEN=MAXLOGNAME -DLIBIOSEXEC_INTERNAL -DLIBIOSEXEC_PREFIXED_ROOT=$(LIBIOSEXEC_PREFIXED_ROOT) -DDEFAULT_INTERPRETER='"$(DEFAULT_INTERPRETER)"' $^
 
 libiosexec.$(SOVER).dylib: $(SRC:%.c=%.o)
 ifeq ($(shell uname -s), Linux)
@@ -33,7 +39,7 @@ libiosexec.a: $(SRC:%.c=%.o)
 	$(RANLIB) $@
 
 test: $(SRC) tests/test.c
-	$(CC) $(CFLAGS) -g -D_PW_NAME_LEN=MAXLOGNAME -DLIBIOSEXEC_INTERNAL -DTEST -I. -o tests/test $(LDFLAGS) $^
+	$(CC) $(CFLAGS) -g -D_PW_NAME_LEN=MAXLOGNAME -DLIBIOSEXEC_INTERNAL -DLIBIOSEXEC_INTERNAL -DLIBIOSEXEC_PREFIXED_ROOT=$(LIBIOSEXEC_PREFIXED_ROOT) -DDEFAULT_INTERPRETER='"$(DEFAULT_INTERPRETER)"' -DTEST -I. -o tests/test $(LDFLAGS) $^
 	cd tests && ./test
 
 install: all
