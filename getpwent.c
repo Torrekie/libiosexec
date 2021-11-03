@@ -1,453 +1,411 @@
-/*	$OpenBSD: getpwent.c,v 1.63 2019/07/02 15:54:05 deraadt Exp $ */
 /*
- * Copyright (c) 2008 Theo de Raadt
- * Copyright (c) 1988, 1993
- *	The Regents of the University of California.  All rights reserved.
- * Portions Copyright (c) 1994, 1995, 1996, Jason Downs.  All rights reserved.
+ * Copyright (c) 1999 Apple Computer, Inc. All rights reserved.
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- * 1. Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- * 3. Neither the name of the University nor the names of its contributors
- *    may be used to endorse or promote products derived from this software
- *    without specific prior written permission.
+ * @APPLE_LICENSE_HEADER_START@
+ * 
+ * Portions Copyright (c) 1999 Apple Computer, Inc.  All Rights
+ * Reserved.  This file contains Original Code and/or Modifications of
+ * Original Code as defined in and that are subject to the Apple Public
+ * Source License Version 1.1 (the "License").  You may not use this file
+ * except in compliance with the License.  Please obtain a copy of the
+ * License at http://www.apple.com/publicsource and read it before using
+ * this file.
+ * 
+ * The Original Code and all software distributed under the License are
+ * distributed on an "AS IS" basis, WITHOUT WARRANTY OF ANY KIND, EITHER
+ * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
+ * INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE OR NON- INFRINGEMENT.  Please see the
+ * License for the specific language governing rights and limitations
+ * under the License.
+ * 
+ * @APPLE_LICENSE_HEADER_END@
+ */
+/*
+ * Copyright 1997 Apple Computer, Inc. (unpublished)
+ * 
+ * /etc/passwd file access routines.
+ * Just read from the /etc/passwd file and skip the dbm database, since
+ * lookupd does all flat file lookups when the system is multi-user.
+ * These routines are only used in single-user mode.
  *
- * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
- * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
- * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
- * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
- * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
- * SUCH DAMAGE.
+ * 17 Apr 1997 file created - Marc Majka
  */
 
-#include <sys/param.h>	/* ALIGN */
-#include <sys/mman.h>
-#include <fcntl.h>
-#include <db.h>
-#include <syslog.h>
-#include <pwd.h>
-#include <errno.h>
-#include <unistd.h>
-#include <stdbool.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <limits.h>
+#include <pwd.h>
+#include <unistd.h>
 
-#define __THREAD_NAME(name)	__CONCAT(_thread_tagname_,name)
+#define forever for (;;)
 
-#define _THREAD_PRIVATE_KEY(name)					\
-	static void *__THREAD_NAME(name)
+#define _PWENT_ 0
+#define _PWNAM_ 1
+#define _PWUID_ 2
 
-#define _THREAD_PRIVATE_MUTEX_LOCK(name)		do {} while (0)
-#define _THREAD_PRIVATE_MUTEX_UNLOCK(name)		do {} while (0)
+static struct passwd _pw = { 0 };
+static FILE *_pfp;
+static int _pwStayOpen;
+static int _pwFileFormat = 1;
 
-#define _PW_NAME_LEN MAXLOGNAME
-#define _PW_BUF_LEN	1024
-
-#define MINIMUM(a, b)	(((a) < (b)) ? (a) : (b))
-
-struct pw_storage {
-	struct passwd pw;
-	uid_t uid;
-	char name[_PW_NAME_LEN + 1];
-	char pwbuf[_PW_BUF_LEN];
-};
-
-_THREAD_PRIVATE_KEY(pw);
-
-static DB *_pw_db;			/* password database */
-
-/* mmap'd password storage */
-static struct pw_storage *_pw_storage = MAP_FAILED;
-
-/* Following are used only by setpwent(), getpwent(), and endpwent() */
-static int _pw_keynum;			/* key counter */
-static int _pw_stayopen;		/* keep fd's open */
-static int _pw_flags;			/* password flags */
-
-static int __hashpw(DBT *, char *buf, size_t buflen, struct passwd *, int *);
-static int __initdb(int);
-static struct passwd *_pwhashbyname(const char *name, char *buf,
-	size_t buflen, struct passwd *pw, int *);
-static struct passwd *_pwhashbyuid(uid_t uid, char *buf,
-	size_t buflen, struct passwd *pw, int *);
-
-
-static struct passwd *
-__get_pw_buf(char **bufp, size_t *buflenp, uid_t uid, const char *name)
+static void
+free_pw()
 {
-	bool remap = true;
+	if (_pw.pw_name != NULL)   free(_pw.pw_name);
+	if (_pw.pw_passwd != NULL) free(_pw.pw_passwd);
+	if (_pw.pw_class != NULL)  free(_pw.pw_class);
+	if (_pw.pw_gecos != NULL)  free(_pw.pw_gecos);
+	if (_pw.pw_dir != NULL)    free(_pw.pw_dir);
+	if (_pw.pw_shell != NULL)  free(_pw.pw_shell);
 
-	/* Unmap the old buffer unless we are looking up the same uid/name */
-	if (_pw_storage != MAP_FAILED) {
-		if (name != NULL) {
-			if (strcmp(_pw_storage->name, name) == 0) {
-#ifdef PWDEBUG
-				struct syslog_data sdata = SYSLOG_DATA_INIT;
-				syslog_r(LOG_CRIT | LOG_CONS, &sdata,
-				    "repeated passwd lookup of user \"%s\"",
-				    name);
-#endif
-				remap = false;
-			}
-		} else if (uid != (uid_t)-1) {
-			if (_pw_storage->uid == uid) {
-#ifdef PWDEBUG
-				struct syslog_data sdata = SYSLOG_DATA_INIT;
-				syslog_r(LOG_CRIT | LOG_CONS, &sdata,
-				    "repeated passwd lookup of uid %u",
-				    uid);
-#endif
-				remap = false;
+	_pw.pw_name = NULL;
+	_pw.pw_passwd = NULL;
+	_pw.pw_class = NULL;
+	_pw.pw_gecos = NULL;
+	_pw.pw_dir = NULL;
+	_pw.pw_shell = NULL;
+}
+
+static void
+freeList(char **l)
+{
+	int i;
+
+	if (l == NULL) return;
+	for (i = 0; l[i] != NULL; i++)
+	{
+		if (l[i] != NULL) free(l[i]);
+		l[i] = NULL;
+	}
+	if (l != NULL) free(l);
+}
+
+static unsigned int
+listLength(char **l)
+{
+	int i;
+
+	if (l == NULL) return 0;
+	for (i = 0; l[i] != NULL; i++);
+	return i;
+}
+
+static char *
+copyString(char *s)
+{
+	int len;
+	char *t;
+
+	if (s == NULL) return NULL;
+
+	len = strlen(s) + 1;
+	t = malloc(len);
+	bcopy(s, t, len);
+	return t;
+}
+
+
+static char **
+insertString(char *s, char **l, unsigned int x)
+{
+	int i, len;
+
+	if (s == NULL) return l;
+	if (l == NULL) 
+	{
+		l = (char **)malloc(2 * sizeof(char *));
+		l[0] = copyString(s);
+		l[1] = NULL;
+		return l;
+	}
+
+	for (i = 0; l[i] != NULL; i++);
+	len = i + 1; /* count the NULL on the end of the list too! */
+
+	l = (char **)realloc(l, (len + 1) * sizeof(char *));
+
+	if ((x >= (len - 1)) || (x == (unsigned int)-1))
+	{
+		l[len - 1] = copyString(s);
+		l[len] = NULL;
+		return l;
+	}
+
+	for (i = len; i > x; i--) l[i] = l[i - 1];
+	l[x] = copyString(s);
+	return l;
+}
+
+static char **
+appendString(char *s, char **l)
+{
+	return insertString(s, l, (unsigned int)-1);
+}
+
+
+static char **
+tokenize(const char *data, const char *sep)
+{
+	char **tokens = NULL;
+	const char *p;
+	int i, j, len;
+	char buf[4096];
+	int scanning;
+
+	if (data == NULL) return NULL;
+	if (sep == NULL)
+	{
+		tokens = appendString((char *)data, tokens);
+		return tokens;
+	}
+
+	len = strlen(sep);
+
+	p = data;
+
+	while (p[0] != '\0')
+	{
+		/* skip leading white space */
+		while ((p[0] == ' ') || (p[0] == '\t') || (p[0] == '\n')) p++;
+
+		/* check for end of line */
+		if (p[0] == '\0') break;
+
+		/* copy data */
+		i = 0;
+		scanning = 1;
+		for (j = 0; (j < len) && (scanning == 1); j++)
+		{
+			if (p[0] == sep[j] || (p[0] == '\0')) scanning = 0;
+		}
+
+		while (scanning == 1)
+		{
+			buf[i++] = p[0];
+			p++;
+			for (j = 0; (j < len) && (scanning == 1); j++)
+			{
+				if (p[0] == sep[j] || (p[0] == '\0')) scanning = 0;
 			}
 		}
-		if (remap)
-			munmap(_pw_storage, sizeof(*_pw_storage));
-	}
+	
+		/* back over trailing whitespace */
+		i--;
+		if (i > -1) { /* did we actually copy anything? */
+			while ((buf[i] == ' ') || (buf[i] == '\t') || (buf[i] == '\n')) i--;
+		}
+		buf[++i] = '\0';
+	
+		tokens = appendString(buf, tokens);
 
-	if (remap) {
-		_pw_storage = mmap(NULL, sizeof(*_pw_storage),
-		    PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON, -1, 0);
-		if (_pw_storage == MAP_FAILED)
-			return NULL;
-		if (name != NULL)
-			strlcpy(_pw_storage->name, name, sizeof(_pw_storage->name));
-		_pw_storage->uid = uid;
-	}
+		/* check for end of line */
+		if (p[0] == '\0') break;
 
-	*bufp = _pw_storage->pwbuf;
-	*buflenp = sizeof(_pw_storage->pwbuf);
-	return &_pw_storage->pw;
+		/* skip separator */
+		scanning = 1;
+		for (j = 0; (j < len) && (scanning == 1); j++)
+		{
+			if (p[0] == sep[j])
+			{
+				p++;
+				scanning = 0;
+			}
+		}
+
+		if ((scanning == 0) && p[0] == '\0')
+		{
+			/* line ended at a separator - add a null member */
+			tokens = appendString("", tokens);
+			return tokens;
+		}
+	}
+	return tokens;
 }
 
 struct passwd *
-ie_getpwent(void)
+parseUser(char *data)
 {
-	char bf[1 + sizeof(_pw_keynum)];
-	struct passwd *pw, *ret = NULL;
-	char *pwbuf;
-	size_t buflen;
-	DBT key;
+	char **tokens;
+	int ntokens;
 
-	_THREAD_PRIVATE_MUTEX_LOCK(pw);
-	if (!_pw_db && !__initdb(0))
-		goto done;
+	if (data == NULL) return NULL;
 
-	/* Allocate space for struct and strings, unmapping the old. */
-	if ((pw = __get_pw_buf(&pwbuf, &buflen, -1, NULL)) == NULL)
-		goto done;
-
-
-	++_pw_keynum;
-	bf[0] = _PW_KEYBYNUM;
-	bcopy((char *)&_pw_keynum, &bf[1], sizeof(_pw_keynum));
-	key.data = (u_char *)bf;
-	key.size = 1 + sizeof(_pw_keynum);
-	if (__hashpw(&key, pwbuf, buflen, pw, &_pw_flags)) {
-		ret = pw;
-		goto done;
+	tokens = tokenize(data, ":");
+	ntokens = listLength(tokens);
+	if (( _pwFileFormat && (ntokens != 10)) ||
+	    (!_pwFileFormat && (ntokens !=  7)))
+	{
+		freeList(tokens);
+		return NULL;
 	}
 
-done:
-	_THREAD_PRIVATE_MUTEX_UNLOCK(pw);
-	return (ret);
-}
+	free_pw();
 
+	_pw.pw_name = tokens[0];
+	_pw.pw_passwd = tokens[1];
+	_pw.pw_uid = atoi(tokens[2]);
+	free(tokens[2]);
+	_pw.pw_gid = atoi(tokens[3]);
+	free(tokens[3]);
 
-static struct passwd *
-_pwhashbyname(const char *name, char *buf, size_t buflen, struct passwd *pw,
-    int *flagsp)
-{
-	char bf[1 + _PW_NAME_LEN];
-	size_t len;
-	DBT key;
-	int r;
-
-	len = strlen(name);
-	if (len > _PW_NAME_LEN)
-		return (NULL);
-	bf[0] = _PW_KEYBYNAME;
-	bcopy(name, &bf[1], MINIMUM(len, _PW_NAME_LEN));
-	key.data = (u_char *)bf;
-	key.size = 1 + MINIMUM(len, _PW_NAME_LEN);
-	r = __hashpw(&key, buf, buflen, pw, flagsp);
-	if (r)
-		return (pw);
-	return (NULL);
-}
-
-static struct passwd *
-_pwhashbyuid(uid_t uid, char *buf, size_t buflen, struct passwd *pw,
-    int *flagsp)
-{
-	char bf[1 + sizeof(int)];
-	DBT key;
-	int r;
-
-	bf[0] = _PW_KEYBYUID;
-	bcopy(&uid, &bf[1], sizeof(uid));
-	key.data = (u_char *)bf;
-	key.size = 1 + sizeof(uid);
-	r = __hashpw(&key, buf, buflen, pw, flagsp);
-	if (r)
-		return (pw);
-	return (NULL);
-}
-
-static int
-getpwnam_internal(const char *name, struct passwd *pw, char *buf, size_t buflen,
-    struct passwd **pwretp, bool shadow, bool reentrant)
-{
-	struct passwd *pwret = NULL;
-	int flags = 0, *flagsp = &flags;
-	int my_errno = 0;
-	int saved_errno, tmp_errno;
-
-	_THREAD_PRIVATE_MUTEX_LOCK(pw);
-	saved_errno = errno;
-	errno = 0;
-	if (!_pw_db && !__initdb(shadow))
-		goto fail;
-
-	if (!reentrant) {
-		/* Allocate space for struct and strings, unmapping the old. */
-		if ((pw = __get_pw_buf(&buf, &buflen, -1, name)) == NULL)
-			goto fail;
-		flagsp = &_pw_flags;
+	if (_pwFileFormat)
+	{
+		_pw.pw_class = tokens[4];
+		_pw.pw_change = atoi(tokens[5]);
+		free(tokens[5]);
+		_pw.pw_expire = atoi(tokens[6]);
+		free(tokens[6]);
+		_pw.pw_gecos = tokens[7];
+		_pw.pw_dir = tokens[8];
+		_pw.pw_shell = tokens[9];
+	}
+	else
+	{
+		_pw.pw_class = copyString("");
+		_pw.pw_change = 0;
+		_pw.pw_expire = 0;
+		_pw.pw_gecos = tokens[4];
+		_pw.pw_dir = tokens[5];
+		_pw.pw_shell = tokens[6];
 	}
 
-	if (!pwret)
-		pwret = _pwhashbyname(name, buf, buflen, pw, flagsp);
+	free(tokens); 
 
-	if (!_pw_stayopen) {
-		tmp_errno = errno;
-		(void)(_pw_db->close)(_pw_db);
-		_pw_db = NULL;
-		errno = tmp_errno;
-	}
-fail:
-	if (pwretp)
-		*pwretp = pwret;
-	if (pwret == NULL)
-		my_errno = errno;
-	errno = saved_errno;
-	_THREAD_PRIVATE_MUTEX_UNLOCK(pw);
-	return (my_errno);
+	return &_pw;
 }
 
-int
-ie_getpwnam_r(const char *name, struct passwd *pw, char *buf, size_t buflen,
-    struct passwd **pwretp)
+static char *
+getLine(FILE *fp)
 {
-	return getpwnam_internal(name, pw, buf, buflen, pwretp, false, true);
-}
+	char s[1024];
+	char *out;
 
-struct passwd *
-ie_getpwnam(const char *name)
-{
-	struct passwd *pw = NULL;
-	int my_errno;
+	s[0] = '\0';
 
-	my_errno = getpwnam_internal(name, NULL, NULL, 0, &pw, false, false);
-	if (my_errno) {
-		pw = NULL;
-		errno = my_errno;
-	}
-	return (pw);
-}
+	if (fp == NULL) return NULL;
 
-struct passwd *
-getpwnam_shadow(const char *name)
-{
-	struct passwd *pw = NULL;
-	int my_errno;
+	fgets(s, 1024, fp);
+	if (s[0] == '\0') return NULL;
 
-	my_errno = getpwnam_internal(name, NULL, NULL, 0, &pw, true, false);
-	if (my_errno) {
-		pw = NULL;
-		errno = my_errno;
-	}
-	return (pw);
-}
+	if (s[0] != '#') s[strlen(s) - 1] = '\0';
 
-static int
-getpwuid_internal(uid_t uid, struct passwd *pw, char *buf, size_t buflen,
-    struct passwd **pwretp, bool shadow, bool reentrant)
-{
-	struct passwd *pwret = NULL;
-	int flags = 0, *flagsp = &flags;
-	int my_errno = 0;
-	int saved_errno, tmp_errno;
-
-	_THREAD_PRIVATE_MUTEX_LOCK(pw);
-	saved_errno = errno;
-	errno = 0;
-	if (!_pw_db && !__initdb(shadow))
-		goto fail;
-
-	if (!reentrant) {
-		/* Allocate space for struct and strings, unmapping the old. */
-		if ((pw = __get_pw_buf(&buf, &buflen, uid, NULL)) == NULL)
-			goto fail;
-		flagsp = &_pw_flags;
-	}
-
-	if (!pwret)
-		pwret = _pwhashbyuid(uid, buf, buflen, pw, flagsp);
-
-	if (!_pw_stayopen) {
-		tmp_errno = errno;
-		(void)(_pw_db->close)(_pw_db);
-		_pw_db = NULL;
-		errno = tmp_errno;
-	}
-fail:
-	if (pwretp)
-		*pwretp = pwret;
-	if (pwret == NULL)
-		my_errno = errno;
-	errno = saved_errno;
-	_THREAD_PRIVATE_MUTEX_UNLOCK(pw);
-	return (my_errno);
-}
-
-
-int
-ie_getpwuid_r(uid_t uid, struct passwd *pw, char *buf, size_t buflen,
-    struct passwd **pwretp)
-{
-	return getpwuid_internal(uid, pw, buf, buflen, pwretp, false, true);
-}
-
-struct passwd *
-ie_getpwuid(uid_t uid)
-{
-	struct passwd *pw = NULL;
-	int my_errno;
-
-	my_errno = getpwuid_internal(uid, NULL, NULL, 0, &pw, false, false);
-	if (my_errno) {
-		pw = NULL;
-		errno = my_errno;
-	}
-	return (pw);
-}
-
-struct passwd *
-getpwuid_shadow(uid_t uid)
-{
-	struct passwd *pw = NULL;
-	int my_errno;
-
-	my_errno = getpwuid_internal(uid, NULL, NULL, 0, &pw, true, false);
-	if (my_errno) {
-		pw = NULL;
-		errno = my_errno;
-	}
-	return (pw);
+	out = copyString(s);
+	return out;
 }
 
 int
 ie_setpassent(int stayopen)
 {
-	_THREAD_PRIVATE_MUTEX_LOCK(pw);
-	_pw_keynum = 0;
-	_pw_stayopen = stayopen;
-	_THREAD_PRIVATE_MUTEX_UNLOCK(pw);
-	return (1);
+	_pwStayOpen = stayopen;
+	return(1);
+}
+
+int
+ie_setpwent()
+{
+	_pwStayOpen = 0;
+	return(1);
 }
 
 void
-ie_setpwent(void)
+ie_endpwent()
 {
-	(void) ie_setpassent(0);
+	if (_pfp != NULL)
+	{
+		fclose(_pfp);
+		_pfp = NULL;
+	}
 }
 
-void
-ie_endpwent(void)
-{
-	int saved_errno;
-
-	_THREAD_PRIVATE_MUTEX_LOCK(pw);
-	saved_errno = errno;
-	_pw_keynum = 0;
-	if (_pw_db) {
-		(void)(_pw_db->close)(_pw_db);
-		_pw_db = NULL;
+int
+openpw() {
+	if (_pfp == NULL)
+	{
+		char *pwFile;
+		if (geteuid() == 0)
+		{
+			pwFile = _PATH_MASTERPASSWD;
+		}
+		else
+		{
+			pwFile = _PATH_PASSWD;
+			_pwFileFormat = 0;
+		}
+		_pfp = fopen(pwFile, "r");
+		if (_pfp == NULL)
+		{
+			perror(pwFile);
+			return(0);
+		}
 	}
-	errno = saved_errno;
-	_THREAD_PRIVATE_MUTEX_UNLOCK(pw);
+	else
+		rewind(_pfp);
+	return 1;
 }
 
-static int
-__initdb(int shadow)
+static struct passwd *
+getpw(const char *nam, uid_t uid, int which)
 {
-	static int warned;
-	int saved_errno = errno;
+	char *line;
+	struct passwd *pw;
 
-	if (shadow)
-		_pw_db = dbopen(_PATH_SMP_DB, O_RDONLY, 0, DB_HASH, NULL);
-	if (!_pw_db)
-	    _pw_db = dbopen(_PATH_MP_DB, O_RDONLY, 0, DB_HASH, NULL);
-	if (_pw_db) {
-		errno = saved_errno;
-		return (1);
+	if (_pfp == NULL)
+		openpw();
+
+	if (which != 0)
+	{
+		if (ie_setpwent() == 0) return NULL;
 	}
-	if (!warned) {
-		saved_errno = errno;
-		errno = saved_errno;
-		warned = 1;
+
+	forever
+	{
+		line = getLine(_pfp);
+		if (line == NULL) break;
+
+		if (line[0] == '#') 
+		{
+			free(line);
+			line = NULL;
+			continue;
+		}
+
+		pw = parseUser(line);
+		free(line);
+		line = NULL;
+
+		if ((pw == NULL) || (which == _PWENT_))
+		{
+			if (_pwStayOpen == 0) ie_endpwent();
+			return pw;
+		}
+
+		if (((which == _PWNAM_) && (!strcmp(nam, pw->pw_name))) ||
+			((which == _PWUID_) && (uid == pw->pw_uid)))
+		{
+			if (_pwStayOpen == 0) ie_endpwent();
+			return pw;
+		}
 	}
-	return (0);
+
+	if (_pwStayOpen == 0) ie_endpwent();
+	return NULL;
 }
 
-static int
-__hashpw(DBT *key, char *buf, size_t buflen, struct passwd *pw,
-    int *flagsp)
+struct passwd *
+ie_getpwent()
 {
-	char *p, *t;
-	DBT data;
+	return getpw(NULL, 0, _PWENT_);
+}
 
-	if ((_pw_db->get)(_pw_db, key, &data, 0))
-		return (0);
-	p = (char *)data.data;
-	if (data.size > buflen) {
-		errno = ERANGE;
-		return (0);
-	}
+struct passwd *
+ie_getpwnam(const char *nam)
+{
+	return getpw(nam, 0, _PWNAM_);
+}
 
-	t = buf;
-#define	EXPAND(e)	e = t; while ((*t++ = *p++));
-	EXPAND(pw->pw_name);
-	EXPAND(pw->pw_passwd);
-	bcopy(p, (char *)&pw->pw_uid, sizeof(int));
-	p += sizeof(int);
-	bcopy(p, (char *)&pw->pw_gid, sizeof(int));
-	p += sizeof(int);
-	bcopy(p, (char *)&pw->pw_change, sizeof(time_t));
-	p += sizeof(time_t);
-	EXPAND(pw->pw_class);
-	EXPAND(pw->pw_gecos);
-	EXPAND(pw->pw_dir);
-	EXPAND(pw->pw_shell);
-	bcopy(p, (char *)&pw->pw_expire, sizeof(time_t));
-	p += sizeof(time_t);
-
-	/* See if there's any data left.  If so, read in flags. */
-	if (data.size > (p - (char *)data.data)) {
-		bcopy(p, (char *)flagsp, sizeof(int));
-		p += sizeof(int);
-	} else
-		*flagsp = _PASSWORD_NOUID|_PASSWORD_NOGID;	/* default */
-	return (1);
+struct passwd *
+ie_getpwuid(uid_t uid)
+{
+	return getpw(NULL, uid, _PWUID_);
 }
